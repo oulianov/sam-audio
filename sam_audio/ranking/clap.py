@@ -8,13 +8,15 @@ from sam_audio.model.config import ClapRankerConfig
 from sam_audio.ranking.ranker import Ranker
 
 
-def get_model(device="cpu"):
+def get_model(checkpoint_file=None, device="cpu"):
     import laion_clap
 
     model = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-tiny").to(device)
-    checkpoint_file = hf_hub_download(
-        repo_id="lukewys/laion_clap", filename="630k-best.pt"
-    )
+
+    if checkpoint_file is None:
+        checkpoint_file = hf_hub_download(
+            repo_id="lukewys/laion_clap", filename="630k-best.pt"
+        )
     state_dict = torch.load(checkpoint_file, map_location=device, weights_only=False)[
         "state_dict"
     ]
@@ -35,7 +37,7 @@ class ClapRanker(Ranker):
         self.laion_data_module = data
         super().__init__()
         self.config = config
-        self.model = get_model()
+        self.model = get_model(checkpoint_file=config.checkpoint)
 
     def _prepare_audio(self, audio, sample_rate):
         audio_features = []
