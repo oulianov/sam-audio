@@ -3,7 +3,7 @@
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, override
 
 import torch
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
@@ -359,4 +359,85 @@ class SAMAudio(BaseModel):
                 )
 
 
-__all__ = ["SAMAudio"]
+class SamAudioModelTextOnly(SAMAudio):
+    """
+    A memory-optimized version of SAMAudio that strictly handles Audio and Text.
+
+    This class:
+    1. Does NOT initialize vision_encoder, rankers, or span predictors in __init__.
+    2. Overrides load_state_dict to ignore those keys from the checkpoint.
+    3. Overrides _get_video_features to return empty embeddings without using a model.
+    """
+
+    def __init__(self, cfg: SAMAudioConfig):
+        # We explicitly call the grandparent (BaseModel) init, bypassing SAMAudio.__init__
+        # This prevents the heavy components from being initialized even for a split second.
+        super(SAMAudio, self).__init__()
+
+        # --- Initialize only the core components ---
+        self.audio_codec = DACVAE(cfg.audio_codec)
+        self.text_encoder = T5TextEncoder(cfg.text_encoder)
+
+        # We DO NOT initialize self.vision_encoder.
+        # However, we save the dimension for the zero-tensor generation.
+        self.vision_encoder = None
+        self._vision_encoder_dim = cfg.vision_encoder.dim
+
+        self.transformer = DiT(cfg.transformer)
+        self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
+
+        # We keep alignment to ensure tensor shapes match the transformer input expectations
+        self.align_masked_video = AlignModalities(
+            cfg.vision_encoder.dim, cfg.transformer.dim
+        )
+        self.embed_anchors = EmbedAnchors(
+            cfg.num_anchors, cfg.anchor_embedding_dim, cfg.transformer.dim
+        )
+        self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
+        self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
+
+        # Explicitly set heavy optional components to None
+        self.visual_ranker = None
+        self.text_ranker = None
+        self.span_predictor = None
+        self.span_predictor_transform = None
+
+    def _get_video_features(self, video, audio_features):
+        """
+        Override: Returns zero-tensors instead of running a vision encoder.
+        """
+        B, T, _ = audio_features.shape
+        # Create zeros matching [Batch, VisionDim, Time]
+        return audio_features.new_zeros(B, self._vision_encoder_dim, T)
+
+    @override
+    def load_state_dict(self, state_dict, strict=True):
+        """
+        Override: Filters out keys for components we deleted so we don't get errors
+        or load them into memory.
+        """
+        # We pass strict=False to the parent so it doesn't crash on missing keys immediately.
+        # We will handle the "real" missing keys check manually below.
+        missing_keys, unexpected_keys = super(BaseModel, self).load_state_dict(
+            state_dict, strict=False
+        )
+
+        # Updated Regex: Includes ^vision_encoder now
+        skip_regex = re.compile(
+            "(^vision_encoder|^text_encoder|^visual_ranker|^text_ranker|^span_predictor)"
+        )
+
+        # Check if we are missing keys that we ACTUALLY care about (not the ones we skipped)
+        real_missing_keys = [x for x in missing_keys if not re.search(skip_regex, x)]
+
+        if len(real_missing_keys) > 0:
+            raise RuntimeError(
+                f"Missing keys: {real_missing_keys}\n(Unexpected keys are ignored)"
+            )
+
+        # If strict=True was passed to this function, we theoretically should error on
+        # unexpected_keys (the weights for the vision encoder present in the file),
+        # but the purpose of this class is to ignore them.
+
+
+__all__ = ["SAMAudio", "SamAudioModelTextOnly"]
