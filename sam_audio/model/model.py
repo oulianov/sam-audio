@@ -3,7 +3,7 @@
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, override
+from typing import Any, Dict, Optional
 
 import torch
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
@@ -410,7 +410,6 @@ class SamAudioModelTextOnly(SAMAudio):
         # Create zeros matching [Batch, VisionDim, Time]
         return audio_features.new_zeros(B, self._vision_encoder_dim, T)
 
-    @override
     def load_state_dict(self, state_dict, strict=True):
         """
         Override: Filters out keys for components we deleted so we don't get errors
