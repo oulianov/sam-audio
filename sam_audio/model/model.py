@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
@@ -578,6 +579,116 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             audio_pad_mask=audio_pad_mask,
         )
 
+    def _prepare_static_denoiser_cache(
+        self,
+        audio_features: torch.Tensor,
+        text_features: torch.Tensor,
+        masked_video_features: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        anchor_alignment: torch.Tensor,
+    ) -> Dict[str, Optional[torch.Tensor] | bool]:
+        cache_start = time.perf_counter()
+        logger.info("SAM Audio optimized model | prepare_static_denoiser_cache start")
+
+        with torch.autograd.profiler.record_function(
+            "sam_audio/prepare_static_denoiser_cache"
+        ):
+            memory_base = self.memory_proj(text_features)
+
+            feature_dim = audio_features.size(-1)
+            can_split_input_projection = (
+                self.proj.in_features == feature_dim * 3
+                and self.align_masked_video.gate is not None
+            )
+
+            static_aligned_inputs = None
+            proj_noisy_weight = None
+
+            if can_split_input_projection:
+                weight = self.proj.weight
+                proj_noisy_weight, _, proj_audio_weight = weight.split(
+                    feature_dim, dim=1
+                )
+                static_aligned_inputs = F.linear(
+                    audio_features, proj_audio_weight, self.proj.bias
+                )
+
+                if masked_video_features is not None:
+                    video_term = self.align_masked_video.conv(masked_video_features)
+                    video_term = video_term.permute(0, 2, 1)
+                    if self.align_masked_video.normalize:
+                        video_term = self.align_masked_video.layer_norm(video_term)
+                    static_aligned_inputs = static_aligned_inputs + (
+                        self.align_masked_video.gate.tanh() * video_term
+                    )
+
+                gathered_anchor_ids = anchor_ids.gather(1, anchor_alignment)
+                anchor_embs = self.embed_anchors.embed(gathered_anchor_ids)
+                anchor_proj = self.embed_anchors.proj(anchor_embs)
+                static_aligned_inputs = static_aligned_inputs + (
+                    self.embed_anchors.gate.tanh() * anchor_proj
+                )
+
+        logger.info(
+            "SAM Audio optimized model | prepare_static_denoiser_cache complete "
+            f"in {int((time.perf_counter() - cache_start) * 1000)}ms "
+            f"(split_input_projection={can_split_input_projection})"
+        )
+
+        return {
+            "memory_base": memory_base,
+            "proj_noisy_weight": proj_noisy_weight,
+            "static_aligned_inputs": static_aligned_inputs,
+            "can_split_input_projection": can_split_input_projection,
+        }
+
+    def _denoiser_step_optimized(
+        self,
+        noisy_audio: torch.Tensor,
+        time: torch.Tensor,
+        audio_features: torch.Tensor,
+        text_features: torch.Tensor,
+        text_mask: torch.Tensor,
+        masked_video_features: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        anchor_alignment: torch.Tensor,
+        audio_pad_mask: torch.Tensor,
+        static_denoiser_cache: Dict[str, Optional[torch.Tensor] | bool],
+    ) -> torch.Tensor:
+        static_aligned_inputs = static_denoiser_cache["static_aligned_inputs"]
+        proj_noisy_weight = static_denoiser_cache["proj_noisy_weight"]
+        memory_base = static_denoiser_cache["memory_base"]
+        can_split_input_projection = static_denoiser_cache["can_split_input_projection"]
+
+        if (
+            can_split_input_projection
+            and static_aligned_inputs is not None
+            and proj_noisy_weight is not None
+        ):
+            dynamic_aligned_inputs = F.linear(noisy_audio, proj_noisy_weight, None)
+            aligned_inputs = dynamic_aligned_inputs + static_aligned_inputs
+            timestep_emb = self.timestep_emb(time, pos=time).unsqueeze(1)
+            memory = memory_base + timestep_emb
+            return self.transformer(
+                aligned_inputs,
+                time,
+                padding_mask=audio_pad_mask,
+                memory=memory,
+                memory_padding_mask=text_mask,
+            )
+
+        return self._denoiser_step(
+            noisy_audio,
+            time,
+            audio_features,
+            text_features,
+            text_mask,
+            masked_video_features,
+            anchor_ids,
+            anchor_alignment,
+            audio_pad_mask,
+        )
+
     def _solve_fixed_midpoint(
         self,
         noise: torch.Tensor,
@@ -591,6 +702,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         anchor_ids: torch.Tensor,
         anchor_alignment: torch.Tensor,
         audio_pad_mask: torch.Tensor,
+        static_denoiser_cache: Dict[str, Optional[torch.Tensor] | bool],
     ) -> torch.Tensor:
         solve_start = time.perf_counter()
         logger.info(
@@ -605,7 +717,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         for step_idx in range(num_steps):
             step_start = time.perf_counter()
             time_start = state.new_full((batch_size,), current_time)
-            k1 = self._denoiser_step(
+            k1 = self._denoiser_step_optimized(
                 state,
                 time_start,
                 audio_features,
@@ -615,10 +727,11 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 anchor_ids,
                 anchor_alignment,
                 audio_pad_mask,
+                static_denoiser_cache,
             )
             midpoint_state = state + half_step * k1
             time_mid = state.new_full((batch_size,), current_time + half_step)
-            k2 = self._denoiser_step(
+            k2 = self._denoiser_step_optimized(
                 midpoint_state,
                 time_mid,
                 audio_features,
@@ -628,6 +741,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 anchor_ids,
                 anchor_alignment,
                 audio_pad_mask,
+                static_denoiser_cache,
             )
             state = state + step_size * k2
             current_time += step_size
@@ -754,9 +868,22 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 anchor_alignment,
                 audio_pad_mask,
             ) = self._prepare_forward_args(batch, candidates=reranking_candidates)
+            logger.info(
+                "SAM Audio optimized model | get_forward_args block complete "
+                f"in {int((time.perf_counter() - forward_args_start) * 1000)}ms"
+            )
+
+        static_cache_start = time.perf_counter()
+        static_denoiser_cache = self._prepare_static_denoiser_cache(
+            audio_features=audio_features,
+            text_features=text_features,
+            masked_video_features=masked_video_features,
+            anchor_ids=anchor_ids,
+            anchor_alignment=anchor_alignment,
+        )
         logger.info(
-            "SAM Audio optimized model | get_forward_args block complete "
-            f"in {int((time.perf_counter() - forward_args_start) * 1000)}ms"
+            "SAM Audio optimized model | static denoiser cache prepared "
+            f"in {int((time.perf_counter() - static_cache_start) * 1000)}ms"
         )
 
         if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
@@ -805,12 +932,13 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     anchor_ids=anchor_ids,
                     anchor_alignment=anchor_alignment,
                     audio_pad_mask=audio_pad_mask,
+                    static_denoiser_cache=static_denoiser_cache,
                 )
         else:
             logger.info("SAM Audio optimized model | using torchdiffeq odeint fallback")
 
             def vector_field(t, noisy_audio):
-                return self._denoiser_step(
+                return self._denoiser_step_optimized(
                     noisy_audio,
                     t.expand(noisy_audio.size(0)),
                     audio_features,
@@ -820,6 +948,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     anchor_ids,
                     anchor_alignment,
                     audio_pad_mask,
+                    static_denoiser_cache,
                 )
 
             odeint_start = time.perf_counter()
