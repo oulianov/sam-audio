@@ -180,7 +180,8 @@ class SAMAudio(BaseModel):
         )
 
     def _get_audio_features(self, audios: torch.Tensor):
-        audio_features = self.audio_codec(audios).transpose(1, 2)
+        with torch.autograd.profiler.record_function("sam_audio/audio_codec_encode"):
+            audio_features = self.audio_codec(audios).transpose(1, 2)
         return torch.cat([audio_features, audio_features], dim=2)
 
     def _get_video_features(self, video, audio_features):
@@ -206,11 +207,14 @@ class SAMAudio(BaseModel):
         return tensor[::candidates]
 
     def _get_forward_args(self, batch: Batch, candidates: int = 1):
-        audio_features = self._get_audio_features(batch.audios)
-        text_features, text_mask = self.text_encoder(batch.descriptions)
-        masked_video_features = self._get_video_features(
-            batch.masked_video, audio_features
-        )
+        with torch.autograd.profiler.record_function("sam_audio/get_audio_features"):
+            audio_features = self._get_audio_features(batch.audios)
+        with torch.autograd.profiler.record_function("sam_audio/text_encoder"):
+            text_features, text_mask = self.text_encoder(batch.descriptions)
+        with torch.autograd.profiler.record_function("sam_audio/get_video_features"):
+            masked_video_features = self._get_video_features(
+                batch.masked_video, audio_features
+            )
 
         return {
             "audio_features": self._repeat_for_reranking(audio_features, candidates),
@@ -254,7 +258,10 @@ class SAMAudio(BaseModel):
         predict_spans: bool = False,
     ) -> SeparationResult:
         # Encode audio
-        forward_args = self._get_forward_args(batch, candidates=reranking_candidates)
+        with torch.autograd.profiler.record_function("sam_audio/get_forward_args"):
+            forward_args = self._get_forward_args(
+                batch, candidates=reranking_candidates
+            )
 
         if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
             batch = self.predict_spans(
@@ -272,7 +279,8 @@ class SAMAudio(BaseModel):
         C = C // 2  # we stack audio_features, so the actual channels is half
 
         if noise is None:
-            noise = torch.randn_like(audio_features)
+            with torch.autograd.profiler.record_function("sam_audio/noise_init"):
+                noise = torch.randn_like(audio_features)
 
         def vector_field(t, noisy_audio):
             res = self.forward(
@@ -282,26 +290,29 @@ class SAMAudio(BaseModel):
             )
             return res
 
-        states = odeint(
-            vector_field,
-            noise,
-            torch.tensor([0.0, 1.0], device=noise.device),
-            **ode_opt,
-        )
+        with torch.autograd.profiler.record_function("sam_audio/odeint"):
+            states = odeint(
+                vector_field,
+                noise,
+                torch.tensor([0.0, 1.0], device=noise.device),
+                **ode_opt,
+            )
         generated_features = states[-1].transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
-        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
-            B, 2, -1
-        )
+        with torch.autograd.profiler.record_function("sam_audio/audio_codec_decode"):
+            wavs = self.audio_codec.decode(
+                generated_features.reshape(2 * B, C, T)
+            ).view(B, 2, -1)
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
-        target_wavs = self.unbatch(
-            wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
-        )
-        residual_wavs = self.unbatch(
-            wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
-        )
+        with torch.autograd.profiler.record_function("sam_audio/unbatch_outputs"):
+            target_wavs = self.unbatch(
+                wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
+            )
+            residual_wavs = self.unbatch(
+                wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
+            )
 
         if (
             reranking_candidates > 1
@@ -439,4 +450,270 @@ class SamAudioModelTextOnly(SAMAudio):
         # but the purpose of this class is to ignore them.
 
 
-__all__ = ["SAMAudio", "SamAudioModelTextOnly"]
+class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
+    """
+    Compile-friendlier text-only SAM Audio model.
+
+    This preserves the same learned modules and parameter names as
+    ``SamAudioModelTextOnly`` so existing checkpoints still load, but it restructures
+    the denoising path into tensor-only helpers and replaces the generic fixed-step
+    midpoint ODE solve with an equivalent explicit midpoint loop when the requested
+    solver configuration matches the default inference path.
+    """
+
+    _ODE_INTERVAL = (0.0, 1.0)
+
+    def _prepare_forward_args(self, batch: Batch, candidates: int):
+        forward_args = self._get_forward_args(batch, candidates=candidates)
+        return (
+            forward_args,
+            forward_args["audio_features"],
+            forward_args["text_features"],
+            forward_args["text_mask"],
+            forward_args["masked_video_features"],
+            forward_args["anchor_ids"],
+            forward_args["anchor_alignment"],
+            forward_args["audio_pad_mask"],
+        )
+
+    def _supports_explicit_midpoint(self, ode_opt: Dict[str, Any]) -> tuple[bool, float, int]:
+        method = ode_opt.get("method")
+        options = ode_opt.get("options") or {}
+        step_size = options.get("step_size")
+
+        if method != "midpoint" or step_size is None:
+            return False, 0.0, 0
+
+        start, end = self._ODE_INTERVAL
+        total_span = end - start
+        raw_steps = total_span / float(step_size)
+        rounded_steps = round(raw_steps)
+        if rounded_steps <= 0 or not math.isclose(raw_steps, rounded_steps):
+            return False, 0.0, 0
+
+        unsupported_keys = set(ode_opt) - {"method", "options"}
+        unsupported_option_keys = set(options) - {"step_size"}
+        if unsupported_keys or unsupported_option_keys:
+            return False, 0.0, 0
+
+        return True, float(step_size), int(rounded_steps)
+
+    def _denoiser_step(
+        self,
+        noisy_audio: torch.Tensor,
+        time: torch.Tensor,
+        audio_features: torch.Tensor,
+        text_features: torch.Tensor,
+        text_mask: torch.Tensor,
+        masked_video_features: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        anchor_alignment: torch.Tensor,
+        audio_pad_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.forward(
+            noisy_audio=noisy_audio,
+            audio_features=audio_features,
+            text_features=text_features,
+            time=time,
+            masked_video_features=masked_video_features,
+            text_mask=text_mask,
+            anchor_ids=anchor_ids,
+            anchor_alignment=anchor_alignment,
+            audio_pad_mask=audio_pad_mask,
+        )
+
+    def _solve_fixed_midpoint(
+        self,
+        noise: torch.Tensor,
+        *,
+        step_size: float,
+        num_steps: int,
+        audio_features: torch.Tensor,
+        text_features: torch.Tensor,
+        text_mask: torch.Tensor,
+        masked_video_features: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        anchor_alignment: torch.Tensor,
+        audio_pad_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        state = noise
+        batch_size = state.size(0)
+        current_time = self._ODE_INTERVAL[0]
+        half_step = 0.5 * step_size
+
+        for _ in range(num_steps):
+            time_start = state.new_full((batch_size,), current_time)
+            k1 = self._denoiser_step(
+                state,
+                time_start,
+                audio_features,
+                text_features,
+                text_mask,
+                masked_video_features,
+                anchor_ids,
+                anchor_alignment,
+                audio_pad_mask,
+            )
+            midpoint_state = state + half_step * k1
+            time_mid = state.new_full((batch_size,), current_time + half_step)
+            k2 = self._denoiser_step(
+                midpoint_state,
+                time_mid,
+                audio_features,
+                text_features,
+                text_mask,
+                masked_video_features,
+                anchor_ids,
+                anchor_alignment,
+                audio_pad_mask,
+            )
+            state = state + step_size * k2
+            current_time += step_size
+
+        return state
+
+    def _finalize_outputs(
+        self,
+        batch: Batch,
+        denoised_features: torch.Tensor,
+        noise: torch.Tensor,
+        reranking_candidates: int,
+    ) -> SeparationResult:
+        B, T, C2 = denoised_features.shape
+        C = C2 // 2
+
+        with torch.autograd.profiler.record_function("sam_audio/audio_codec_decode"):
+            wavs = self.audio_codec.decode(
+                denoised_features.transpose(1, 2).reshape(2 * B, C, T)
+            ).view(B, 2, -1)
+
+        bsz = wavs.size(0) // reranking_candidates
+        sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
+        with torch.autograd.profiler.record_function("sam_audio/unbatch_outputs"):
+            target_wavs = self.unbatch(
+                wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
+            )
+            residual_wavs = self.unbatch(
+                wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
+            )
+
+        if (
+            reranking_candidates > 1
+            and batch.masked_video is not None
+            and self.visual_ranker is not None
+        ):
+            scores = self.visual_ranker(
+                extracted_audio=target_wavs,
+                videos=batch.masked_video,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        elif reranking_candidates > 1 and self.text_ranker is not None:
+            input_audio = [
+                audio[:, :size].expand(reranking_candidates, -1)
+                for audio, size in zip(batch.audios, sizes, strict=False)
+            ]
+            scores = self.text_ranker(
+                extracted_audio=target_wavs,
+                input_audio=input_audio,
+                descriptions=batch.descriptions,
+                sample_rate=self.audio_codec.sample_rate,
+            )
+            idxs = scores.argmax(dim=1)
+        else:
+            idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+
+        return SeparationResult(
+            target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+            residual=[
+                wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
+            ],
+            noise=noise,
+        )
+
+    @torch.inference_mode()
+    def separate(
+        self,
+        batch: Batch,
+        noise: Optional[torch.Tensor] = None,
+        ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
+        reranking_candidates: int = 1,
+        predict_spans: bool = False,
+    ) -> SeparationResult:
+        with torch.autograd.profiler.record_function("sam_audio/get_forward_args"):
+            (
+                forward_args,
+                audio_features,
+                text_features,
+                text_mask,
+                masked_video_features,
+                anchor_ids,
+                anchor_alignment,
+                audio_pad_mask,
+            ) = self._prepare_forward_args(batch, candidates=reranking_candidates)
+
+        if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
+            batch = self.predict_spans(
+                batch=batch,
+                audio_features=self._unrepeat_from_reranking(
+                    forward_args["audio_features"], reranking_candidates
+                ),
+                audio_pad_mask=self._unrepeat_from_reranking(
+                    forward_args["audio_pad_mask"], reranking_candidates
+                ),
+            )
+
+        if noise is None:
+            with torch.autograd.profiler.record_function("sam_audio/noise_init"):
+                noise = torch.randn_like(audio_features)
+
+        use_explicit_midpoint, step_size, num_steps = self._supports_explicit_midpoint(
+            ode_opt
+        )
+
+        if use_explicit_midpoint:
+            with torch.autograd.profiler.record_function("sam_audio/odeint"):
+                denoised_features = self._solve_fixed_midpoint(
+                    noise,
+                    step_size=step_size,
+                    num_steps=num_steps,
+                    audio_features=audio_features,
+                    text_features=text_features,
+                    text_mask=text_mask,
+                    masked_video_features=masked_video_features,
+                    anchor_ids=anchor_ids,
+                    anchor_alignment=anchor_alignment,
+                    audio_pad_mask=audio_pad_mask,
+                )
+        else:
+            def vector_field(t, noisy_audio):
+                return self._denoiser_step(
+                    noisy_audio,
+                    t.expand(noisy_audio.size(0)),
+                    audio_features,
+                    text_features,
+                    text_mask,
+                    masked_video_features,
+                    anchor_ids,
+                    anchor_alignment,
+                    audio_pad_mask,
+                )
+
+            with torch.autograd.profiler.record_function("sam_audio/odeint"):
+                states = odeint(
+                    vector_field,
+                    noise,
+                    torch.tensor(list(self._ODE_INTERVAL), device=noise.device),
+                    **ode_opt,
+                )
+            denoised_features = states[-1]
+
+        return self._finalize_outputs(
+            batch=batch,
+            denoised_features=denoised_features,
+            noise=noise,
+            reranking_candidates=reranking_candidates,
+        )
+
+
+__all__ = ["SAMAudio", "SamAudioModelTextOnly", "SamAudioModelTextOnlyOptimized"]
