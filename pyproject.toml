@@ -21,7 +21,8 @@ dependencies = [
     "imagebind@git+https://github.com/facebookresearch/ImageBind.git",
     "laion-clap@git+https://github.com/lematt1991/CLAP.git",
     "numpy",
-    "perception-models@git+https://github.com/facebookresearch/perception_models@unpin-deps",
+    # only commented to pass macos linting, do not commit. 
+    # "perception-models@git+https://github.com/facebookresearch/perception_models@unpin-deps",
     "pydub",
     "torch",
     "torchaudio",
@@ -29,6 +30,7 @@ dependencies = [
     "torchdiffeq",
     "torchvision",
     "transformers>=4.54.0",
+    "descript-audiotools@git+https://github.com/descriptinc/audiotools",
 ]
 
 [tool.setuptools.packages.find]
