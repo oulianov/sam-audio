@@ -225,11 +225,19 @@ class SAMAudio(BaseModel):
     def _unrepeat_from_reranking(self, tensor, candidates):
         return tensor[::candidates]
 
-    def _get_forward_args(self, batch: Batch, candidates: int = 1):
+    def _get_forward_args(
+        self,
+        batch: Batch,
+        candidates: int = 1,
+        verbose: bool = False,
+    ):
         with torch.autograd.profiler.record_function("sam_audio/get_audio_features"):
             audio_features = self._get_audio_features(batch.audios)
         with torch.autograd.profiler.record_function("sam_audio/text_encoder"):
-            text_features, text_mask = self.text_encoder(batch.descriptions)
+            text_features, text_mask = self.text_encoder(
+                batch.descriptions,
+                verbose=verbose,
+            )
         with torch.autograd.profiler.record_function("sam_audio/get_video_features"):
             masked_video_features = self._get_video_features(
                 batch.masked_video, audio_features
@@ -275,11 +283,14 @@ class SAMAudio(BaseModel):
         ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
         reranking_candidates: int = 1,
         predict_spans: bool = False,
+        verbose: bool = False,
     ) -> SeparationResult:
         # Encode audio
         with torch.autograd.profiler.record_function("sam_audio/get_forward_args"):
             forward_args = self._get_forward_args(
-                batch, candidates=reranking_candidates
+                batch,
+                candidates=reranking_candidates,
+                verbose=verbose,
             )
 
         if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
@@ -482,7 +493,12 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
 
     _ODE_INTERVAL = (0.0, 1.0)
 
-    def _prepare_forward_args(self, batch: Batch, candidates: int):
+    def _prepare_forward_args(
+        self,
+        batch: Batch,
+        candidates: int,
+        verbose: bool = False,
+    ):
         prepare_start = time.perf_counter()
         logger.info(
             "SAM Audio optimized model | prepare_forward_args start "
@@ -498,7 +514,10 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
 
         text_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/text_encoder"):
-            text_features, text_mask = self.text_encoder(batch.descriptions)
+            text_features, text_mask = self.text_encoder(
+                batch.descriptions,
+                verbose=verbose,
+            )
         logger.info(
             "SAM Audio optimized model | text_encoder complete "
             f"in {int((time.perf_counter() - text_start) * 1000)}ms"
@@ -747,6 +766,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
         reranking_candidates: int = 1,
         predict_spans: bool = False,
+        verbose: bool = False,
     ) -> SeparationResult:
         separate_start = time.perf_counter()
         logger.info(
@@ -765,7 +785,11 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 anchor_ids,
                 anchor_alignment,
                 audio_pad_mask,
-            ) = self._prepare_forward_args(batch, candidates=reranking_candidates)
+            ) = self._prepare_forward_args(
+                batch,
+                candidates=reranking_candidates,
+                verbose=verbose,
+            )
             logger.info(
                 "SAM Audio optimized model | get_forward_args block complete "
                 f"in {int((time.perf_counter() - forward_args_start) * 1000)}ms"

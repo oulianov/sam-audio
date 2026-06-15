@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -23,7 +24,8 @@ class TextEmbeddingDiskCache:
         namespace: str,
         max_entries: int = 100,
     ):
-        self.cache_dir = Path(cache_dir) / self._safe_namespace(namespace)
+        self.namespace = self._safe_namespace(namespace)
+        self.cache_dir = Path(cache_dir) / self.namespace
         self.index_path = self.cache_dir / "index.json"
         self.max_entries = max_entries
 
@@ -183,11 +185,20 @@ class T5TextEncoder(torch.nn.Module):
             max_entries=max_entries,
         )
 
-    def forward(self, texts: list[str]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        texts: list[str],
+        verbose: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         device = next(self.model.parameters()).device
         dtype = next(self.model.parameters()).dtype
         if self.disk_cache is not None:
-            cached = self._forward_with_disk_cache(texts, device=device, dtype=dtype)
+            cached = self._forward_with_disk_cache(
+                texts,
+                device=device,
+                dtype=dtype,
+                verbose=verbose,
+            )
             if cached is not None:
                 return cached
 
@@ -223,6 +234,7 @@ class T5TextEncoder(torch.nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        verbose: bool = False,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         if not texts:
             return None
@@ -234,19 +246,61 @@ class T5TextEncoder(torch.nn.Module):
         missing_texts: list[str] = []
 
         for text in unique_texts:
+            cache_start = time.perf_counter()
             cached = self.disk_cache.get(text, device=device, dtype=dtype)
+            cache_lookup_ms = int((time.perf_counter() - cache_start) * 1000)
             if cached is None:
+                if verbose:
+                    logger.info(
+                        "SAM Audio text embedding cache miss "
+                        f"namespace={self.disk_cache.namespace} "
+                        f"key={TextEmbeddingDiskCache._key(text)[:12]} "
+                        f"cache_lookup_ms={cache_lookup_ms} "
+                        f"prompt={text!r}"
+                    )
                 missing_texts.append(text)
             else:
+                if verbose:
+                    logger.info(
+                        "SAM Audio text embedding cache hit "
+                        f"namespace={self.disk_cache.namespace} "
+                        f"key={TextEmbeddingDiskCache._key(text)[:12]} "
+                        f"cache_load_ms={cache_lookup_ms} "
+                        f"prompt={text!r}"
+                    )
                 encoded_by_text[text] = cached
 
         if missing_texts:
+            embedding_start = time.perf_counter()
             features, masks = self._encode_uncached(missing_texts, device=device)
+            text_embedding_compute_ms = int(
+                (time.perf_counter() - embedding_start) * 1000
+            )
+            if verbose:
+                logger.info(
+                    "SAM Audio text embedding cache computed missing text embeddings "
+                    f"namespace={self.disk_cache.namespace} "
+                    f"count={len(missing_texts)} "
+                    f"text_embedding_compute_ms={text_embedding_compute_ms} "
+                    f"prompts={missing_texts!r}"
+                )
             for idx, text in enumerate(missing_texts):
                 valid_len = int(masks[idx].sum().item())
                 text_features = features[idx, :valid_len].detach()
                 text_mask = masks[idx, :valid_len].detach()
+                cache_store_start = time.perf_counter()
                 self.disk_cache.put(text, text_features, text_mask)
+                cache_store_ms = int(
+                    (time.perf_counter() - cache_store_start) * 1000
+                )
+                if verbose:
+                    logger.info(
+                        "SAM Audio text embedding cache stored embedding "
+                        f"namespace={self.disk_cache.namespace} "
+                        f"key={TextEmbeddingDiskCache._key(text)[:12]} "
+                        f"cache_store_ms={cache_store_ms} "
+                        f"prompt={text!r}"
+                    )
                 encoded_by_text[text] = (text_features, text_mask)
 
         max_len = max(encoded_by_text[text][0].size(0) for text in texts)
