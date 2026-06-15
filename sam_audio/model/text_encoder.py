@@ -13,13 +13,6 @@ import transformers
 
 from sam_audio.model.config import T5EncoderConfig
 
-try:
-    from loguru import logger
-except ImportError:
-    import logging
-
-    logger = logging.getLogger(__name__)
-
 
 class TextEmbeddingDiskCache:
     def __init__(
@@ -74,8 +67,8 @@ class TextEmbeddingDiskCache:
                 features.to(device=device, dtype=dtype),
                 mask.to(device=device, dtype=torch.bool),
             )
-        except Exception:
-            logger.exception("Failed to load SAM Audio text embedding cache entry")
+        except Exception as exc:
+            print(f"Failed to load SAM Audio text embedding cache entry: {exc!r}")
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -114,8 +107,8 @@ class TextEmbeddingDiskCache:
                     os.unlink(tmp_name)
 
             self._record_key(key)
-        except Exception:
-            logger.exception("Failed to write SAM Audio text embedding cache entry")
+        except Exception as exc:
+            print(f"Failed to write SAM Audio text embedding cache entry: {exc!r}")
 
     def _read_index(self) -> list[str]:
         if self.index_path.exists():
@@ -129,8 +122,10 @@ class TextEmbeddingDiskCache:
                         if isinstance(item, str)
                         and (self.cache_dir / f"{item}.pt").exists()
                     ]
-            except Exception:
-                logger.exception("Failed to read SAM Audio text embedding cache index")
+            except Exception as exc:
+                print(
+                    f"Failed to read SAM Audio text embedding cache index: {exc!r}"
+                )
 
         return [
             path.stem
@@ -255,7 +250,7 @@ class T5TextEncoder(torch.nn.Module):
             cache_lookup_ms = int((time.perf_counter() - cache_start) * 1000)
             if cached is None:
                 if verbose:
-                    logger.info(
+                    print(
                         "SAM Audio text embedding cache miss "
                         f"namespace={self.disk_cache.namespace} "
                         f"key={TextEmbeddingDiskCache._key(text)[:12]} "
@@ -265,7 +260,7 @@ class T5TextEncoder(torch.nn.Module):
                 missing_texts.append(text)
             else:
                 if verbose:
-                    logger.info(
+                    print(
                         "SAM Audio text embedding cache hit "
                         f"namespace={self.disk_cache.namespace} "
                         f"key={TextEmbeddingDiskCache._key(text)[:12]} "
@@ -281,7 +276,7 @@ class T5TextEncoder(torch.nn.Module):
                 (time.perf_counter() - embedding_start) * 1000
             )
             if verbose:
-                logger.info(
+                print(
                     "SAM Audio text embedding cache computed missing text embeddings "
                     f"namespace={self.disk_cache.namespace} "
                     f"count={len(missing_texts)} "
@@ -298,7 +293,7 @@ class T5TextEncoder(torch.nn.Module):
                     (time.perf_counter() - cache_store_start) * 1000
                 )
                 if verbose:
-                    logger.info(
+                    print(
                         "SAM Audio text embedding cache stored embedding "
                         f"namespace={self.disk_cache.namespace} "
                         f"key={TextEmbeddingDiskCache._key(text)[:12]} "
