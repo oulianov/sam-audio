@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import logging
 import os
 import tempfile
 import time
@@ -14,7 +13,12 @@ import transformers
 
 from sam_audio.model.config import T5EncoderConfig
 
-logger = logging.getLogger(__name__)
+try:
+    from loguru import logger
+except ImportError:
+    import logging
+
+    logger = logging.getLogger(__name__)
 
 
 class TextEmbeddingDiskCache:
