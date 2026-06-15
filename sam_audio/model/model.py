@@ -112,6 +112,18 @@ class SAMAudio(BaseModel):
     def sample_rate(self):
         return self.audio_codec.sample_rate
 
+    def configure_text_embedding_cache(
+        self,
+        cache_dir: str,
+        model_size: str,
+        max_entries: int = 100,
+    ) -> None:
+        self.text_encoder.configure_disk_cache(
+            cache_dir=cache_dir,
+            namespace=model_size,
+            max_entries=max_entries,
+        )
+
     def align_inputs(
         self,
         noisy_audio,
