@@ -552,15 +552,31 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             "SAM Audio optimized model | prepare_forward_args complete "
             f"in {int((time.perf_counter() - prepare_start) * 1000)}ms"
         )
+        text_attention_mask = forward_args["text_mask"]
+        if (
+            text_attention_mask is not None
+            and text_attention_mask.dtype == torch.bool
+            and bool(text_attention_mask.all().item())
+        ):
+            text_attention_mask = None
+
+        audio_attention_mask = forward_args["audio_pad_mask"]
+        if (
+            audio_attention_mask is not None
+            and audio_attention_mask.dtype == torch.bool
+            and bool(audio_attention_mask.all().item())
+        ):
+            audio_attention_mask = None
+
         return (
             forward_args,
             forward_args["audio_features"],
             forward_args["text_features"],
-            forward_args["text_mask"],
+            text_attention_mask,
             forward_args["masked_video_features"],
             forward_args["anchor_ids"],
             forward_args["anchor_alignment"],
-            forward_args["audio_pad_mask"],
+            audio_attention_mask,
         )
 
     def _supports_explicit_midpoint(self, ode_opt: Dict[str, Any]) -> tuple[bool, float, int]:
@@ -591,12 +607,26 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         time: torch.Tensor,
         audio_features: torch.Tensor,
         text_features: torch.Tensor,
-        text_mask: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
         masked_video_features: torch.Tensor,
         anchor_ids: torch.Tensor,
         anchor_alignment: torch.Tensor,
-        audio_pad_mask: torch.Tensor,
+        audio_pad_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if noisy_audio.is_cuda and self.transformer.use_sageattention:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                return self.forward(
+                    noisy_audio=noisy_audio,
+                    audio_features=audio_features,
+                    text_features=text_features,
+                    time=time,
+                    masked_video_features=masked_video_features,
+                    text_mask=text_mask,
+                    anchor_ids=anchor_ids,
+                    anchor_alignment=anchor_alignment,
+                    audio_pad_mask=audio_pad_mask,
+                ).to(noisy_audio.dtype)
+
         return self.forward(
             noisy_audio=noisy_audio,
             audio_features=audio_features,
@@ -617,11 +647,11 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         num_steps: int,
         audio_features: torch.Tensor,
         text_features: torch.Tensor,
-        text_mask: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
         masked_video_features: torch.Tensor,
         anchor_ids: torch.Tensor,
         anchor_alignment: torch.Tensor,
-        audio_pad_mask: torch.Tensor,
+        audio_pad_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
         solve_start = time.perf_counter()
         logger.info(

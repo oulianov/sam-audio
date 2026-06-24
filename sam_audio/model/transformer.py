@@ -14,15 +14,15 @@ from .patcher import Patcher
 from .rope import RotaryEmbedding
 
 
-def _load_sageattention_kernel():
+def _load_sageattention_kernels():
     try:
-        from sageattention import sageattn_qk_int8_pv_fp16_triton
+        from sageattention import sageattn, sageattn_qk_int8_pv_fp16_triton
     except Exception as exc:
         raise RuntimeError(
             "SageAttention is enabled for SAM Audio attention, but the "
             "`sageattention` package is not installed or failed to import."
         ) from exc
-    return sageattn_qk_int8_pv_fp16_triton
+    return sageattn, sageattn_qk_int8_pv_fp16_triton
 
 
 def gate(x, gate):
@@ -112,9 +112,13 @@ class Attention(nn.Module):
         self.use_qk_norm = use_qk_norm
         self.use_sageattention = use_sageattention
         self.sageattention_dtype = torch.float16
-        self.sageattention_kernel = (
-            _load_sageattention_kernel() if use_sageattention else None
-        )
+        self.sageattention_kernel = None
+        self.sageattention_masked_kernel = None
+        if use_sageattention:
+            (
+                self.sageattention_kernel,
+                self.sageattention_masked_kernel,
+            ) = _load_sageattention_kernels()
 
         self.wq = torch.nn.Linear(dim, n_heads * head_dim, bias=fc_bias)
         self.wk, self.wv = [
@@ -154,7 +158,10 @@ class Attention(nn.Module):
                 "SageAttention is enabled for SAM Audio attention, but the "
                 "attention tensors are not on CUDA."
             )
-        if self.sageattention_kernel is None:
+        if (
+            self.sageattention_kernel is None
+            or self.sageattention_masked_kernel is None
+        ):
             raise RuntimeError(
                 "SageAttention is enabled for SAM Audio attention, but no "
                 "kernel has been loaded for this attention module."
@@ -175,14 +182,24 @@ class Attention(nn.Module):
             attn_mask = attn_mask.to(q.dtype)
 
         try:
-            output = self.sageattention_kernel(
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                tensor_layout="HND",
-                is_causal=False,
-                attn_mask=attn_mask,
-            )
+            if attn_mask is None:
+                output = self.sageattention_kernel(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    tensor_layout="HND",
+                    is_causal=False,
+                )
+            else:
+                output = self.sageattention_masked_kernel(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    tensor_layout="HND",
+                    quantization_backend="cuda",
+                    is_causal=False,
+                    attn_mask=attn_mask,
+                )
         except Exception as exc:
             raise RuntimeError(
                 "SageAttention is enabled for SAM Audio attention, but the "
@@ -468,6 +485,7 @@ class DiT(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.dropout = config.dropout
+        self.use_sageattention = config.use_sageattention
         if config.in_channels is not None:
             self.data_proj = torch.nn.Linear(config.in_channels, config.dim)
 
