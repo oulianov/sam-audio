@@ -49,7 +49,10 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
 
         for key, value in model_kwargs.items():
             if key in config:
-                config[key] = value
+                if isinstance(config[key], dict) and isinstance(value, dict):
+                    config[key] = {**config[key], **value}
+                else:
+                    config[key] = value
 
         config = cls.config_cls(**config)
         model = cls(config)

@@ -109,6 +109,7 @@ class TransformerConfig:
         context_norm: bool = False,
         out_channels: int = 256,
         in_channels: Optional[int] = None,
+        use_sageattention: bool = False,
     ):
         self.dim = dim
         self.n_heads = n_heads
@@ -133,6 +134,7 @@ class TransformerConfig:
         self.context_norm = context_norm
         self.out_channels = out_channels
         self.in_channels = in_channels
+        self.use_sageattention = use_sageattention
 
 
 class RankerConfig:

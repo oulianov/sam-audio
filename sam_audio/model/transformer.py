@@ -14,6 +14,17 @@ from .patcher import Patcher
 from .rope import RotaryEmbedding
 
 
+def _load_sageattention_kernel():
+    try:
+        from sageattention import sageattn_qk_int8_pv_fp16_triton
+    except Exception as exc:
+        raise RuntimeError(
+            "SageAttention is enabled for SAM Audio attention, but the "
+            "`sageattention` package is not installed or failed to import."
+        ) from exc
+    return sageattn_qk_int8_pv_fp16_triton
+
+
 def gate(x, gate):
     return x * gate
 
@@ -90,6 +101,7 @@ class Attention(nn.Module):
         norm_eps: float = 1e-5,
         use_qk_norm: bool = False,
         fc_bias: bool = False,
+        use_sageattention: bool = False,
     ):
         super().__init__()
         assert n_heads % n_kv_heads == 0
@@ -98,6 +110,11 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.use_qk_norm = use_qk_norm
+        self.use_sageattention = use_sageattention
+        self.sageattention_dtype = torch.float16
+        self.sageattention_kernel = (
+            _load_sageattention_kernel() if use_sageattention else None
+        )
 
         self.wq = torch.nn.Linear(dim, n_heads * head_dim, bias=fc_bias)
         self.wk, self.wv = [
@@ -124,6 +141,56 @@ class Attention(nn.Module):
         x = x.reshape(B, T, C // heads, heads)
         # B x T x C/H x H -> B x H x T x C/H
         return x.permute(0, 3, 1, 2)
+
+    def _sageattention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if not q.is_cuda:
+            raise RuntimeError(
+                "SageAttention is enabled for SAM Audio attention, but the "
+                "attention tensors are not on CUDA."
+            )
+        if self.sageattention_kernel is None:
+            raise RuntimeError(
+                "SageAttention is enabled for SAM Audio attention, but no "
+                "kernel has been loaded for this attention module."
+            )
+
+        original_dtype = q.dtype
+        if original_dtype not in (torch.float16, torch.bfloat16):
+            if self.sageattention_dtype not in (torch.float16, torch.bfloat16):
+                raise RuntimeError(
+                    "SageAttention requires float16 or bfloat16 attention tensors, "
+                    f"but sageattention_dtype is {self.sageattention_dtype}."
+                )
+            q = q.to(self.sageattention_dtype)
+            k = k.to(self.sageattention_dtype)
+            v = v.to(self.sageattention_dtype)
+
+        if attn_mask is not None and attn_mask.dtype not in (torch.bool, q.dtype):
+            attn_mask = attn_mask.to(q.dtype)
+
+        try:
+            output = self.sageattention_kernel(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                tensor_layout="HND",
+                is_causal=False,
+                attn_mask=attn_mask,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "SageAttention is enabled for SAM Audio attention, but the "
+                f"kernel failed for q={tuple(q.shape)} k={tuple(k.shape)} "
+                f"v={tuple(v.shape)} dtype={q.dtype} device={q.device}."
+            ) from exc
+
+        return output.to(original_dtype)
 
     def forward(
         self,
@@ -155,7 +222,10 @@ class Attention(nn.Module):
         if key_padding_mask is not None:
             attn_mask = key_padding_mask[:, None, None, :]
 
-        output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask)
+        if self.use_sageattention:
+            output = self._sageattention(xq, xk, xv, attn_mask)
+        else:
+            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask)
 
         output = rearrange(output, "b h n d -> b n (h d)")
         return self.wo(output)
@@ -303,6 +373,7 @@ class DiTBlock(torch.nn.Module):
         multiple_of: int = 64,
         non_linearity: str = "silu",
         no_cross_attention: bool = False,
+        use_sageattention: bool = False,
     ):
         super().__init__()
         assert dim % n_heads == 0
@@ -322,6 +393,7 @@ class DiTBlock(torch.nn.Module):
             norm_eps=norm_eps,
             use_qk_norm=qk_norm,
             fc_bias=fc_bias,
+            use_sageattention=use_sageattention,
         )
         self.feed_forward = FeedForward(
             dim=dim,
@@ -345,6 +417,7 @@ class DiTBlock(torch.nn.Module):
                 norm_eps=norm_eps,
                 use_qk_norm=qk_norm,
                 fc_bias=fc_bias,
+                use_sageattention=use_sageattention,
             )
 
         self.scale_shift_table = nn.Parameter(
@@ -424,6 +497,7 @@ class DiT(torch.nn.Module):
                     ffn_dim_multiplier=config.ffn_dim_multiplier,
                     multiple_of=config.multiple_of,
                     non_linearity=config.non_linearity,
+                    use_sageattention=config.use_sageattention,
                 )
             )
 
