@@ -3,7 +3,6 @@
 import logging
 import math
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -499,39 +498,19 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         candidates: int,
         verbose: bool = False,
     ):
-        prepare_start = time.perf_counter()
-        logger.info(
-            "SAM Audio optimized model | prepare_forward_args start "
-            f"(batch={batch.audios.size(0)}, candidates={candidates})"
-        )
-
         with torch.autograd.profiler.record_function("sam_audio/get_audio_features"):
             audio_features = self._get_audio_features(batch.audios)
-        logger.info(
-            "SAM Audio optimized model | get_audio_features complete "
-            f"in {int((time.perf_counter() - prepare_start) * 1000)}ms"
-        )
 
-        text_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/text_encoder"):
             text_features, text_mask = self.text_encoder(
                 batch.descriptions,
                 verbose=verbose,
             )
-        logger.info(
-            "SAM Audio optimized model | text_encoder complete "
-            f"in {int((time.perf_counter() - text_start) * 1000)}ms"
-        )
 
-        video_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/get_video_features"):
             masked_video_features = self._get_video_features(
                 batch.masked_video, audio_features
             )
-        logger.info(
-            "SAM Audio optimized model | get_video_features complete "
-            f"in {int((time.perf_counter() - video_start) * 1000)}ms"
-        )
 
         forward_args = {
             "audio_features": self._repeat_for_reranking(audio_features, candidates),
@@ -548,10 +527,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 batch.audio_pad_mask, candidates
             ),
         }
-        logger.info(
-            "SAM Audio optimized model | prepare_forward_args complete "
-            f"in {int((time.perf_counter() - prepare_start) * 1000)}ms"
-        )
         text_attention_mask = forward_args["text_mask"]
         if (
             text_attention_mask is not None
@@ -579,7 +554,9 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             audio_attention_mask,
         )
 
-    def _supports_explicit_midpoint(self, ode_opt: Dict[str, Any]) -> tuple[bool, float, int]:
+    def _supports_explicit_midpoint(
+        self, ode_opt: Dict[str, Any]
+    ) -> tuple[bool, float, int]:
         method = ode_opt.get("method")
         options = ode_opt.get("options") or {}
         step_size = options.get("step_size")
@@ -600,6 +577,68 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             return False, 0.0, 0
 
         return True, float(step_size), int(rounded_steps)
+
+    @staticmethod
+    def _summarize_audio_signal(audio: torch.Tensor) -> str:
+        if audio.numel() == 0:
+            return (
+                "samples=0 finite=0 nan=0 posinf=0 neginf=0 "
+                "min=nan max=nan peak=nan mean=nan rms=nan"
+            )
+
+        finite_mask = torch.isfinite(audio)
+        audio_float64 = audio.to(dtype=torch.float64)
+        finite_audio = torch.where(finite_mask, audio_float64, 0.0)
+        finite_count = finite_mask.sum()
+        divisor = finite_count.clamp_min(1).to(dtype=torch.float64)
+        minimum = torch.where(
+            finite_mask,
+            audio_float64,
+            torch.tensor(float("inf"), dtype=torch.float64, device=audio.device),
+        ).min()
+        maximum = torch.where(
+            finite_mask,
+            audio_float64,
+            torch.tensor(float("-inf"), dtype=torch.float64, device=audio.device),
+        ).max()
+        summary_values = torch.stack(
+            (
+                finite_count.to(dtype=torch.float64),
+                torch.isnan(audio).sum().to(dtype=torch.float64),
+                torch.isposinf(audio).sum().to(dtype=torch.float64),
+                torch.isneginf(audio).sum().to(dtype=torch.float64),
+                minimum,
+                maximum,
+                finite_audio.sum() / divisor,
+                (finite_audio.square().sum() / divisor).sqrt(),
+            )
+        ).cpu()
+        (
+            finite_count_value,
+            nan_count,
+            positive_inf_count,
+            negative_inf_count,
+            minimum,
+            maximum,
+            mean,
+            rms,
+        ) = summary_values.tolist()
+        finite_count_int = int(finite_count_value)
+
+        counts = (
+            f"samples={audio.numel()} finite={finite_count_int} nan={int(nan_count)} "
+            f"posinf={int(positive_inf_count)} neginf={int(negative_inf_count)}"
+        )
+        if finite_count_int == 0:
+            return f"{counts} min=nan max=nan peak=nan mean=nan rms=nan"
+
+        peak = max(abs(minimum), abs(maximum))
+        dynamic_range = maximum - minimum
+        return (
+            f"{counts} min={minimum:.6f} max={maximum:.6f} peak={peak:.6f} "
+            f"mean={mean:.6f} rms={rms:.6f} range={dynamic_range:.6f} "
+            f"near_silent={peak <= 1e-5}"
+        )
 
     def _denoiser_step(
         self,
@@ -653,18 +692,12 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         anchor_alignment: torch.Tensor,
         audio_pad_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        solve_start = time.perf_counter()
-        logger.info(
-            "SAM Audio optimized model | explicit midpoint solve start "
-            f"(steps={num_steps}, step_size={step_size})"
-        )
         state = noise
         batch_size = state.size(0)
         current_time = self._ODE_INTERVAL[0]
         half_step = 0.5 * step_size
 
-        for step_idx in range(num_steps):
-            step_start = time.perf_counter()
+        for _ in range(num_steps):
             time_start = state.new_full((batch_size,), current_time)
             k1 = self._denoiser_step(
                 state,
@@ -692,17 +725,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             )
             state = state + step_size * k2
             current_time += step_size
-            logger.info(
-                "SAM Audio optimized model | midpoint step "
-                f"{step_idx + 1}/{num_steps} complete in "
-                f"{int((time.perf_counter() - step_start) * 1000)}ms "
-                f"(t={current_time - step_size:.4f}->{current_time:.4f})"
-            )
-
-        logger.info(
-            "SAM Audio optimized model | explicit midpoint solve complete "
-            f"in {int((time.perf_counter() - solve_start) * 1000)}ms"
-        )
 
         return state
 
@@ -713,24 +735,16 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         noise: torch.Tensor,
         reranking_candidates: int,
     ) -> SeparationResult:
-        finalize_start = time.perf_counter()
-        logger.info("SAM Audio optimized model | finalize_outputs start")
         B, T, C2 = denoised_features.shape
         C = C2 // 2
 
-        decode_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/audio_codec_decode"):
             wavs = self.audio_codec.decode(
                 denoised_features.transpose(1, 2).reshape(2 * B, C, T)
             ).view(B, 2, -1)
-        logger.info(
-            "SAM Audio optimized model | audio_codec_decode complete "
-            f"in {int((time.perf_counter() - decode_start) * 1000)}ms"
-        )
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
-        unbatch_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/unbatch_outputs"):
             target_wavs = self.unbatch(
                 wavs[:, 0].view(bsz, reranking_candidates, -1), sizes
@@ -738,12 +752,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             residual_wavs = self.unbatch(
                 wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
             )
-        logger.info(
-            "SAM Audio optimized model | unbatch_outputs complete "
-            f"in {int((time.perf_counter() - unbatch_start) * 1000)}ms"
-        )
 
-        rank_start = time.perf_counter()
         if (
             reranking_candidates > 1
             and batch.masked_video is not None
@@ -769,10 +778,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             idxs = scores.argmax(dim=1)
         else:
             idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
-        logger.info(
-            "SAM Audio optimized model | rank/select complete "
-            f"in {int((time.perf_counter() - rank_start) * 1000)}ms"
-        )
 
         result = SeparationResult(
             target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
@@ -780,10 +785,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
             ],
             noise=noise,
-        )
-        logger.info(
-            "SAM Audio optimized model | finalize_outputs complete "
-            f"in {int((time.perf_counter() - finalize_start) * 1000)}ms"
         )
 
         return result
@@ -798,13 +799,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         predict_spans: bool = False,
         verbose: bool = False,
     ) -> SeparationResult:
-        separate_start = time.perf_counter()
-        logger.info(
-            "SAM Audio optimized model | separate start "
-            f"(batch={batch.audios.size(0)}, reranking_candidates={reranking_candidates})"
-        )
-
-        forward_args_start = time.perf_counter()
         with torch.autograd.profiler.record_function("sam_audio/get_forward_args"):
             (
                 forward_args,
@@ -820,13 +814,8 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 candidates=reranking_candidates,
                 verbose=verbose,
             )
-            logger.info(
-                "SAM Audio optimized model | get_forward_args block complete "
-                f"in {int((time.perf_counter() - forward_args_start) * 1000)}ms"
-            )
 
         if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
-            predict_spans_start = time.perf_counter()
             batch = self.predict_spans(
                 batch=batch,
                 audio_features=self._unrepeat_from_reranking(
@@ -836,29 +825,16 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     forward_args["audio_pad_mask"], reranking_candidates
                 ),
             )
-            logger.info(
-                "SAM Audio optimized model | predict_spans complete "
-                f"in {int((time.perf_counter() - predict_spans_start) * 1000)}ms"
-            )
 
         if noise is None:
-            noise_start = time.perf_counter()
             with torch.autograd.profiler.record_function("sam_audio/noise_init"):
                 noise = torch.randn_like(audio_features)
-            logger.info(
-                "SAM Audio optimized model | noise_init complete "
-                f"in {int((time.perf_counter() - noise_start) * 1000)}ms"
-            )
 
         use_explicit_midpoint, step_size, num_steps = self._supports_explicit_midpoint(
             ode_opt
         )
 
         if use_explicit_midpoint:
-            logger.info(
-                "SAM Audio optimized model | using explicit midpoint solver "
-                f"(steps={num_steps}, step_size={step_size})"
-            )
             with torch.autograd.profiler.record_function("sam_audio/odeint"):
                 denoised_features = self._solve_fixed_midpoint(
                     noise,
@@ -873,7 +849,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     audio_pad_mask=audio_pad_mask,
                 )
         else:
-            logger.info("SAM Audio optimized model | using torchdiffeq odeint fallback")
 
             def vector_field(t, noisy_audio):
                 return self._denoiser_step(
@@ -888,7 +863,6 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     audio_pad_mask,
                 )
 
-            odeint_start = time.perf_counter()
             with torch.autograd.profiler.record_function("sam_audio/odeint"):
                 states = odeint(
                     vector_field,
@@ -897,26 +871,24 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                     **ode_opt,
                 )
             denoised_features = states[-1]
-            logger.info(
-                "SAM Audio optimized model | torchdiffeq odeint complete "
-                f"in {int((time.perf_counter() - odeint_start) * 1000)}ms"
-            )
 
-        finalize_start = time.perf_counter()
         result = self._finalize_outputs(
             batch=batch,
             denoised_features=denoised_features,
             noise=noise,
             reranking_candidates=reranking_candidates,
         )
-        logger.info(
-            "SAM Audio optimized model | finalize_outputs returned "
-            f"in {int((time.perf_counter() - finalize_start) * 1000)}ms"
-        )
-        logger.info(
-            "SAM Audio optimized model | separate complete "
-            f"in {int((time.perf_counter() - separate_start) * 1000)}ms"
-        )
+        item_summaries = [
+            (
+                f"item={item_index} "
+                f"target[{self._summarize_audio_signal(target)}] "
+                f"residual[{self._summarize_audio_signal(residual)}]"
+            )
+            for item_index, (target, residual) in enumerate(
+                zip(result.target, result.residual, strict=True), start=1
+            )
+        ]
+        logger.info("SAM Audio batch output summary | " + " | ".join(item_summaries))
         return result
 
 
