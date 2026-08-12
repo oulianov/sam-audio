@@ -491,6 +491,7 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
     """
 
     _ODE_INTERVAL = (0.0, 1.0)
+    _CODEC_DECODE_BATCH_SIZE = 4
 
     def _prepare_forward_args(
         self,
@@ -756,9 +757,15 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         C = C2 // 2
 
         with torch.autograd.profiler.record_function("sam_audio/audio_codec_decode"):
-            wavs = self.audio_codec.decode(
-                denoised_features.transpose(1, 2).reshape(2 * B, C, T)
-            ).view(B, 2, -1)
+            encoded_streams = denoised_features.transpose(1, 2).reshape(2 * B, C, T)
+            decoded_streams = [
+                self.audio_codec.decode(encoded_batch)
+                for encoded_batch in encoded_streams.split(
+                    self._CODEC_DECODE_BATCH_SIZE,
+                    dim=0,
+                )
+            ]
+            wavs = torch.cat(decoded_streams, dim=0).view(B, 2, -1)
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
@@ -816,6 +823,17 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
         predict_spans: bool = False,
         verbose: bool = False,
     ) -> SeparationResult:
+        allocation_retries_before = 0
+        ooms_before = 0
+        if batch.audios.is_cuda:
+            memory_stats_before = torch.cuda.memory_stats(batch.audios.device)
+            allocation_retries_before = memory_stats_before.get(
+                "num_alloc_retries",
+                0,
+            )
+            ooms_before = memory_stats_before.get("num_ooms", 0)
+            torch.cuda.reset_peak_memory_stats(batch.audios.device)
+
         with torch.autograd.profiler.record_function("sam_audio/get_forward_args"):
             (
                 forward_args,
@@ -905,7 +923,27 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
                 zip(result.target, result.residual, strict=True), start=1
             )
         ]
-        logger.info("SAM Audio batch output summary | " + " | ".join(item_summaries))
+        cuda_memory_summary = ""
+        if batch.audios.is_cuda:
+            memory_stats_after = torch.cuda.memory_stats(batch.audios.device)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(batch.audios.device)
+            gibibyte = 1024**3
+            cuda_memory_summary = (
+                " | cuda_memory["
+                f"allocated_gib={torch.cuda.memory_allocated(batch.audios.device) / gibibyte:.3f} "
+                f"reserved_gib={torch.cuda.memory_reserved(batch.audios.device) / gibibyte:.3f} "
+                f"peak_allocated_gib={torch.cuda.max_memory_allocated(batch.audios.device) / gibibyte:.3f} "
+                f"peak_reserved_gib={torch.cuda.max_memory_reserved(batch.audios.device) / gibibyte:.3f} "
+                f"free_gib={free_bytes / gibibyte:.3f} "
+                f"total_gib={total_bytes / gibibyte:.3f} "
+                f"allocation_retries={memory_stats_after.get('num_alloc_retries', 0) - allocation_retries_before} "
+                f"ooms={memory_stats_after.get('num_ooms', 0) - ooms_before}]"
+            )
+        logger.info(
+            "SAM Audio batch output summary | "
+            + " | ".join(item_summaries)
+            + cuda_memory_summary
+        )
         return result
 
 
