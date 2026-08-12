@@ -582,39 +582,43 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
     def _summarize_audio_signal(audio: torch.Tensor) -> str:
         if audio.numel() == 0:
             return (
-                "samples=0 finite=0 nan=0 posinf=0 neginf=0 "
+                "samples=0 finite=0 zero=0 nonzero=0 nan=0 posinf=0 neginf=0 "
                 "min=nan max=nan peak=nan mean=nan rms=nan"
             )
 
         finite_mask = torch.isfinite(audio)
-        audio_float64 = audio.to(dtype=torch.float64)
-        finite_audio = torch.where(finite_mask, audio_float64, 0.0)
+        finite_audio = torch.where(finite_mask, audio, 0.0)
         finite_count = finite_mask.sum()
-        divisor = finite_count.clamp_min(1).to(dtype=torch.float64)
+        zero_count = (finite_mask & (audio == 0)).sum()
+        divisor = finite_count.clamp_min(1).to(dtype=audio.dtype)
         minimum = torch.where(
             finite_mask,
-            audio_float64,
-            torch.tensor(float("inf"), dtype=torch.float64, device=audio.device),
+            audio,
+            torch.tensor(float("inf"), dtype=audio.dtype, device=audio.device),
         ).min()
         maximum = torch.where(
             finite_mask,
-            audio_float64,
-            torch.tensor(float("-inf"), dtype=torch.float64, device=audio.device),
+            audio,
+            torch.tensor(float("-inf"), dtype=audio.dtype, device=audio.device),
         ).max()
         summary_values = torch.stack(
             (
                 finite_count.to(dtype=torch.float64),
+                zero_count.to(dtype=torch.float64),
                 torch.isnan(audio).sum().to(dtype=torch.float64),
                 torch.isposinf(audio).sum().to(dtype=torch.float64),
                 torch.isneginf(audio).sum().to(dtype=torch.float64),
-                minimum,
-                maximum,
-                finite_audio.sum() / divisor,
-                (finite_audio.square().sum() / divisor).sqrt(),
+                minimum.to(dtype=torch.float64),
+                maximum.to(dtype=torch.float64),
+                (finite_audio.sum() / divisor).to(dtype=torch.float64),
+                (finite_audio.square().sum() / divisor)
+                .sqrt()
+                .to(dtype=torch.float64),
             )
         ).cpu()
         (
             finite_count_value,
+            zero_count_value,
             nan_count,
             positive_inf_count,
             negative_inf_count,
@@ -624,10 +628,23 @@ class SamAudioModelTextOnlyOptimized(SamAudioModelTextOnly):
             rms,
         ) = summary_values.tolist()
         finite_count_int = int(finite_count_value)
+        zero_count_int = int(zero_count_value)
+        first_non_finite_indices = torch.nonzero(
+            ~finite_mask.flatten(),
+            as_tuple=False,
+        )[:8, 0].cpu().tolist()
+        first_nonzero_indices = torch.nonzero(
+            (finite_mask & (audio != 0)).flatten(),
+            as_tuple=False,
+        )[:8, 0].cpu().tolist()
 
         counts = (
-            f"samples={audio.numel()} finite={finite_count_int} nan={int(nan_count)} "
-            f"posinf={int(positive_inf_count)} neginf={int(negative_inf_count)}"
+            f"samples={audio.numel()} finite={finite_count_int} "
+            f"zero={zero_count_int} nonzero={finite_count_int - zero_count_int} "
+            f"nan={int(nan_count)} posinf={int(positive_inf_count)} "
+            f"neginf={int(negative_inf_count)} "
+            f"first_non_finite_indices={first_non_finite_indices} "
+            f"first_nonzero_indices={first_nonzero_indices}"
         )
         if finite_count_int == 0:
             return f"{counts} min=nan max=nan peak=nan mean=nan rms=nan"
